@@ -33,6 +33,21 @@ CHUNK_ROWS = 100_000  # Larger chunks reduce per-chunk overhead on large CSV fil
 # Any extra source columns after CN (for example CO:CP) are ignored.
 BASE_INPUT_COLS = 92
 
+# Summary table settings (Percentage table row order + conditional formatting limits)
+PCT_ROW_ORDER = [
+    "Connected ON time",
+    "FM Miss",
+    "Dock Miss Delay connected",
+    "Processing Miss-Delay Manifested",
+    "Processing Miss-Not Manifested",
+    "Report Error",
+]
+CF_GOOD_CATEGORY = "Connected ON time"
+CF_CONNECTED_GOOD_PCT = 95.0   # Connected ON time: >= 95%  -> green
+CF_CONNECTED_WARN_PCT = 90.0   #                    90-95%  -> yellow, below 90% -> red
+CF_MISS_BAD_PCT = 5.0          # Miss rows: >= 5% -> red
+CF_MISS_WARN_PCT = 1.0         #            1-5%  -> yellow, below 1% -> no colour
+
 # in columns me date-time hota hai (comma wali text ho ya serial number)
 KNOWN_DT_COLS = [
     "picked_date",
@@ -500,13 +515,11 @@ def build_dc_summaries(dc_counts):
             del dc_counts[tauru_key]
 
     dcs = sorted(dc_counts.keys(), key=lambda x: str(x).casefold())
-    # Same row order in both tables: biggest Grand Total first (like the Excel pivot).
-    cat_totals = {c: sum(int(dc_counts.get(dc, {}).get(c, 0)) for dc in dcs) for c in categories}
-    categories = sorted(categories, key=lambda c: (-cat_totals[c], categories.index(c)))
-    count_rows = []
-    pct_rows = []
     dc_totals = {dc: sum(dc_counts.get(dc, {}).values()) for dc in dcs}
     grand_total = sum(dc_totals.values())
+
+    count_by_cat = {}
+    pct_by_cat = {}
     for category in categories:
         count_row = {"Final_Remarks": category}
         pct_row = {"Final_Remarks": category}
@@ -518,8 +531,16 @@ def build_dc_summaries(dc_counts):
             pct_row[dc] = round((value / dc_totals[dc]) * 100, 2) if dc_totals[dc] else 0.0
         count_row["Grand Total"] = category_grand
         pct_row["Grand Total"] = round((category_grand / grand_total) * 100, 2) if grand_total else 0.0
-        count_rows.append(count_row)
-        pct_rows.append(pct_row)
+        count_by_cat[category] = count_row
+        pct_by_cat[category] = pct_row
+
+    # Count table: biggest Grand Total first (like the Excel pivot).
+    # Percentage table: SAME order as the count table, so each row matches its count row.
+    count_order = sorted(categories, key=lambda c: (-count_by_cat[c]["Grand Total"], PCT_ROW_ORDER.index(c) if c in PCT_ROW_ORDER else 99))
+    pct_order = count_order   # same row order in both tables, so every row lines up
+    count_rows = [count_by_cat[c] for c in count_order]
+    pct_rows = [pct_by_cat[c] for c in pct_order]
+
     total_count = {"Final_Remarks": "Grand Total"}
     total_pct = {"Final_Remarks": "Grand Total"}
     for dc in dcs:
@@ -532,8 +553,24 @@ def build_dc_summaries(dc_counts):
     return pd.DataFrame(count_rows), pd.DataFrame(pct_rows)
 
 
+def _cf_class(category, pct):
+    """Conditional-format class for one (category, DC) cell based on its percentage."""
+    if category == CF_GOOD_CATEGORY:
+        if pct >= CF_CONNECTED_GOOD_PCT:
+            return "ok"
+        if pct >= CF_CONNECTED_WARN_PCT:
+            return "mid"
+        return "bad"
+    if pct >= CF_MISS_BAD_PCT:
+        return "bad"
+    if pct >= CF_MISS_WARN_PCT:
+        return "mid"
+    return ""
+
+
 def summary_tables_html(count_df, pct_df):
-    """Count table (left) + percentage table (right) in ONE block, Excel-pivot style."""
+    """Count table (left) + percentage table (right) in ONE block, Excel-pivot style,
+    with conditional formatting (green / yellow / red)."""
     import html as _html
 
     css = (
@@ -541,32 +578,65 @@ def summary_tables_html(count_df, pct_df):
         ".fmsum-wrap{display:flex;flex-wrap:wrap;gap:48px;align-items:flex-start;overflow-x:auto;padding:4px 0;}"
         ".fmsum{border-collapse:collapse;font-family:Calibri,'Segoe UI',Arial,sans-serif;"
         "font-size:15px;color:#000;background:#fff;}"
-        ".fmsum th,.fmsum td{border:1px solid #ff0000;padding:6px 12px;text-align:center;"
+        ".fmsum th,.fmsum td{border:1px solid #7f7f7f;padding:5px 12px;text-align:center;"
         "white-space:nowrap;color:#000;font-weight:400;}"
         ".fmsum th{background:#dde0f2;}"
         ".fmsum td:first-child{min-width:250px;}"
         ".fmsum tr.gt td{background:#dde0f2;}"
+        ".fmsum td.ok{background:#c6efce;color:#006100;}"
+        ".fmsum td.mid{background:#ffeb9c;color:#9c5700;}"
+        ".fmsum td.bad{background:#ffc7ce;color:#9c0006;}"
+        ".fmsum.cnt th,.fmsum.cnt td{}"
+        ".fmsum.cnt thead tr:first-child th{border-top-color:#ff0000;}"
+        ".fmsum.cnt th:first-child,.fmsum.cnt td:first-child{border-left-color:#ff0000;}"
+        ".fmsum.cnt th:last-child,.fmsum.cnt td:last-child{border-right-color:#ff0000;}"
+        ".fmsum.cnt tbody tr:last-child td{border-bottom-color:#ff0000;}"
+        ".fmsum-legend{font-size:13px;margin-top:6px;}"
+        ".fmsum-legend span{padding:2px 8px;margin-right:8px;border:1px solid #7f7f7f;}"
         "</style>"
     )
 
-    def one(df, as_pct):
+    pct_lookup = {r[0]: dict(zip(pct_df.columns[1:], r[1:])) for r in pct_df.itertuples(index=False)}
+
+    def one(df, as_pct, extra_class):
         head = "".join("<th>{}</th>".format(_html.escape(str(c))) for c in df.columns)
+        cols = list(df.columns)
         body = []
         last = len(df) - 1
         for idx, row in enumerate(df.itertuples(index=False)):
+            category = str(row[0])
+            is_total = idx == last
             cells = []
             for pos, v in enumerate(row):
+                cls = ""
                 if pos == 0:
-                    txt = str(v)
-                elif as_pct:
-                    txt = "{:.0f}%".format(float(v))
+                    txt = category
                 else:
-                    txt = str(int(v))
-                cells.append("<td>{}</td>".format(_html.escape(txt)))
-            body.append('<tr class="{}">{}</tr>'.format("gt" if idx == last else "", "".join(cells)))
-        return '<table class="fmsum"><thead><tr>{}</tr></thead><tbody>{}</tbody></table>'.format(head, "".join(body))
+                    if as_pct:
+                        txt = "{:.2f}%".format(float(v))
+                    else:
+                        txt = str(int(v))
+                    if not is_total:
+                        p = pct_lookup.get(category, {}).get(cols[pos])
+                        if p is not None:
+                            cls = _cf_class(category, float(p))
+                cells.append('<td class="{}">{}</td>'.format(cls, _html.escape(txt)))
+            body.append('<tr class="{}">{}</tr>'.format("gt" if is_total else "", "".join(cells)))
+        return '<table class="fmsum {}"><thead><tr>{}</tr></thead><tbody>{}</tbody></table>'.format(
+            extra_class, head, "".join(body))
 
-    return css + '<div class="fmsum-wrap">' + one(count_df, False) + one(pct_df, True) + "</div>"
+    legend = (
+        '<div class="fmsum-legend">'
+        '<span style="background:#c6efce;color:#006100;">Good</span>'
+        '<span style="background:#ffeb9c;color:#9c5700;">Watch</span>'
+        '<span style="background:#ffc7ce;color:#9c0006;">Problem</span>'
+        "Connected ON time: {g:.0f}%+ good, {w:.0f}-{g:.0f}% watch, below {w:.0f}% problem. "
+        "Other rows: below {mw:.0f}% no colour, {mw:.0f}-{mb:.0f}% watch, {mb:.0f}%+ problem."
+        "</div>"
+    ).format(g=CF_CONNECTED_GOOD_PCT, w=CF_CONNECTED_WARN_PCT, mw=CF_MISS_WARN_PCT, mb=CF_MISS_BAD_PCT)
+
+    return (css + '<div class="fmsum-wrap">' + one(count_df, False, "cnt") + one(pct_df, True, "pct")
+            + "</div>" + legend)
 
 
 def refresh_output_data(out_path):
