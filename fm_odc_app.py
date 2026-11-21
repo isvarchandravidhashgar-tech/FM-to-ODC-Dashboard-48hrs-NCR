@@ -558,101 +558,103 @@ def build_dc_summaries(dc_counts):
     return pd.DataFrame(count_rows), pd.DataFrame(pct_rows)
 
 
-def _cf_class(category, pct, target):
-    """Conditional-format class for one cell (colour depends on WHO owns the miss + the value).
-    budget = 100 - target = the miss % allowed in total (2% for a 98% target)."""
-    budget = 100.0 - target
+def _owner(category):
+    """Who owns this Final_Remarks row (used for the Owner tag and the bar colour)."""
     if category == CF_GOOD_CATEGORY:
-        return "c-ok" if pct >= target else "c-low"
+        return "tgt"
     if category in CF_FM_CATEGORIES:
-        return "c-fmbig" if pct > budget else ("c-fm" if pct >= budget / 2.0 else "c-fmsmall")
+        return "fm"
     if category in CF_DATA_CATEGORIES:
-        return "c-databig" if pct >= budget / 2.0 else "c-data"
+        return "data"
     if category in CF_TEAM_CATEGORIES:
-        return "c-team0" if pct == 0 else "c-team"
+        return "team"
     return ""
 
 
 def summary_tables_html(count_df, pct_df, target=CF_TARGET_PCT):
-    """Count table (left) + percentage table (right) in ONE block, Excel-pivot style,
-    with conditional formatting for management (who owns each miss)."""
+    """Management-ready summary: count table + percentage table in ONE white card.
+    - Connected ON time row: green if target achieved, soft red if below (with gap in points)
+    - Miss rows in the % table: bar = how much of the allowed miss (100 - target) that row uses
+    - Owner tag on every row: Target / FM / Dashboard Data / DC Team"""
     import html as _html
 
     css = (
         "<style>"
-        ".fmsum-wrap{display:flex;flex-wrap:wrap;gap:48px;align-items:flex-start;overflow-x:auto;padding:4px 0;}"
-        ".fmsum{border-collapse:collapse;font-family:Calibri,'Segoe UI',Arial,sans-serif;"
-        "font-size:15px;color:#000;background:#fff;}"
-        ".fmsum th,.fmsum td{border:1px solid #7f7f7f;padding:5px 12px;text-align:center;"
-        "white-space:nowrap;color:#000;font-weight:400;}"
-        ".fmsum th{background:#dde0f2;}"
-        ".fmsum td:first-child{min-width:250px;}"
-        ".fmsum tr.gt td{background:#dde0f2;color:#000;}"
-        ".fmsum.pct th,.fmsum.pct td{border:1.5px solid #595959;}"
-        ".fmsum.pct tr.gt td{font-weight:700;}"
-        ".fmsum td.c-ok{background:#c6efce;color:#006100;}"
-        ".fmsum td.c-low{background:#fce4d6;color:#c00000;}"
-        ".fmsum td.c-fmsmall{background:#fce4d6;color:#000;}"
-        ".fmsum td.c-fm{background:#f8cbad;color:#000;}"
-        ".fmsum td.c-fmbig{background:#c00000;color:#fff;font-weight:700;}"
-        ".fmsum td.c-data{background:#fff2cc;color:#000;}"
-        ".fmsum td.c-databig{background:#ffe699;color:#000;}"
-        ".fmsum td.c-team{background:#ededed;color:#ff0000;font-weight:700;}"
-        ".fmsum td.c-team0{background:#ededed;color:#595959;}"
-        ".fmsum.cnt thead tr:first-child th{border-top-color:#ff0000;}"
-        ".fmsum.cnt th:first-child,.fmsum.cnt td:first-child{border-left-color:#ff0000;}"
-        ".fmsum.cnt th:last-child,.fmsum.cnt td:last-child{border-right-color:#ff0000;}"
-        ".fmsum.cnt tbody tr:last-child td{border-bottom-color:#ff0000;}"
-        ".fmsum-legend{font-size:13px;margin-top:8px;line-height:2;}"
-        ".fmsum-legend span{padding:2px 8px;margin-right:6px;border:1px solid #7f7f7f;white-space:nowrap;}"
+        ".fmcard{background:#ffffff;border-radius:10px;padding:18px 22px;box-shadow:0 1px 6px rgba(0,0,0,.30);"
+        "overflow-x:auto;}"
+        ".fmwrap{display:flex;flex-wrap:wrap;gap:32px;align-items:flex-start;}"
+        ".fmtitle{font-family:'Segoe UI',Calibri,Arial,sans-serif;font-size:14px;font-weight:600;color:#1f3864;"
+        "margin:0 0 8px 2px;}"
+        "table.fms{border-collapse:collapse;font-family:'Segoe UI',Calibri,Arial,sans-serif;font-size:14px;"
+        "color:#1f2937;background:#ffffff;}"
+        ".fms th{background:#1f3864;color:#ffffff;font-weight:600;padding:9px 10px;text-align:center;"
+        "white-space:nowrap;}"
+        ".fms th:first-child{text-align:left;}"
+        ".fms td{padding:8px 10px;text-align:center;border-bottom:1px solid #e5e7eb;white-space:nowrap;"
+        "color:#1f2937;background:#ffffff;position:relative;}"
+        ".fms td:first-child{text-align:left;font-weight:500;min-width:215px;}"
+        ".fms td.ok{background:#e6f4ea;color:#137333;font-weight:600;}"
+        ".fms td.low{background:#fdecea;color:#b3261e;font-weight:600;}"
+        ".fms td .bar{position:absolute;left:0;top:0;bottom:0;opacity:.85;}"
+        ".fms td .val{position:relative;}"
+        ".fms td .gap{position:relative;font-size:11px;font-weight:500;margin-top:1px;}"
+        ".fms tr.gt td{background:#eef1f7;font-weight:700;border-top:2px solid #1f3864;border-bottom:none;"
+        "color:#1f2937;}"
+        ".chip{display:inline-block;padding:2px 10px;border-radius:999px;font-size:12px;font-weight:600;"
+        "white-space:nowrap;}"
+        ".chip.tgt{background:#e8eefc;color:#1f3864;}"
+        ".chip.fm{background:#fff1e0;color:#b45309;}"
+        ".chip.data{background:#fef9c3;color:#854d0e;}"
+        ".chip.team{background:#fdecea;color:#b3261e;}"
         "</style>"
     )
 
+    budget = 100.0 - target
+    bar_colour = {"fm": "#f6c8a0", "data": "#ffe08a", "team": "#f4a5a0"}
+    owner_text = {"tgt": "Target {:.0f}%+".format(target), "fm": "FM", "data": "Dashboard Data", "team": "DC Team"}
     pct_lookup = {r[0]: dict(zip(pct_df.columns[1:], r[1:])) for r in pct_df.itertuples(index=False)}
 
-    def one(df, as_pct, extra_class):
-        head = "".join("<th>{}</th>".format(_html.escape(str(c))) for c in df.columns)
+    def one(df, as_pct, with_owner):
         cols = list(df.columns)
+        head = "<th>{}</th>".format(_html.escape(str(cols[0])))
+        if with_owner:
+            head += "<th>Owner</th>"
+        head += "".join("<th>{}</th>".format(_html.escape(str(c))) for c in cols[1:])
         body = []
         last = len(df) - 1
         for idx, row in enumerate(df.itertuples(index=False)):
             category = str(row[0])
             is_total = idx == last
-            cells = []
-            for pos, v in enumerate(row):
-                cls = ""
-                if pos == 0:
-                    txt = category
-                    if not as_pct and not is_total:       # count table: colour the label cell too
-                        p0 = pct_lookup.get(category, {}).get("Grand Total")
-                        if p0 is not None:
-                            cls = _cf_class(category, float(p0), target)
-                else:
-                    txt = "{:.2f}%".format(float(v)) if as_pct else str(int(v))
-                    if not is_total:
-                        p = pct_lookup.get(category, {}).get(cols[pos])
-                        if p is not None:
-                            cls = _cf_class(category, float(p), target)
-                cells.append('<td class="{}">{}</td>'.format(cls, _html.escape(txt)))
+            owner = "" if is_total else _owner(category)
+            cells = ["<td>{}</td>".format(_html.escape(category))]
+            if with_owner:
+                chip = '<span class="chip {}">{}</span>'.format(owner, _html.escape(owner_text[owner])) if owner else ""
+                cells.append("<td>{}</td>".format(chip))
+            for pos in range(1, len(row)):
+                v = row[pos]
+                txt = "{:.2f}%".format(float(v)) if as_pct else str(int(v))
+                p = None if is_total else pct_lookup.get(category, {}).get(cols[pos])
+                cls, inner = "", '<span class="val">{}</span>'.format(_html.escape(txt))
+                if p is not None and owner == "tgt":
+                    cls = "ok" if float(p) >= target else "low"
+                    if as_pct:
+                        gap = float(p) - target
+                        inner += '<div class="gap">{} {:.2f} pts vs target</div>'.format(
+                            "&#9650;" if gap >= 0 else "&#9660;", abs(gap))
+                elif p is not None and as_pct and owner in bar_colour and budget > 0:
+                    w = min(float(p) / budget, 1.0) * 100.0
+                    if float(p) > 0:
+                        w = max(w, 3.0)
+                    inner = '<div class="bar" style="width:{:.1f}%;background:{};"></div>'.format(
+                        w, bar_colour[owner]) + inner
+                cells.append('<td class="{}">{}</td>'.format(cls, inner))
             body.append('<tr class="{}">{}</tr>'.format("gt" if is_total else "", "".join(cells)))
-        return '<table class="fmsum {}"><thead><tr>{}</tr></thead><tbody>{}</tbody></table>'.format(
-            extra_class, head, "".join(body))
+        return '<table class="fms"><thead><tr>{}</tr></thead><tbody>{}</tbody></table>'.format(head, "".join(body))
 
-    budget = 100.0 - target
-    legend = (
-        '<div class="fmsum-legend">'
-        '<span style="background:#c6efce;color:#006100;">Connected ON time: target {t:.0f}% achieved</span>'
-        '<span style="background:#fce4d6;color:#c00000;">Connected ON time: below {t:.0f}% target</span>'
-        '<span style="background:#f8cbad;">FM Miss (FM side)</span>'
-        '<span style="background:#c00000;color:#fff;">FM Miss alone is more than {b:.0f}% (target breaker)</span>'
-        '<span style="background:#ffe699;">Report Error (dashboard data issue)</span>'
-        '<span style="background:#ededed;color:#ff0000;font-weight:700;">DC team miss: Dock Miss Delay connected, '
-        'Processing Miss-Delay Manifested, Processing Miss-Not Manifested</span>'
-        "</div>"
-    ).format(t=target, b=budget)
-
-    return (css + '<div class="fmsum-wrap">' + one(count_df, False, "cnt") + one(pct_df, True, "pct")
-            + "</div>" + legend)
+    return (css + '<div class="fmcard"><div class="fmwrap">'
+            + '<div><div class="fmtitle">Shipment Count</div>' + one(count_df, False, True) + "</div>"
+            + '<div><div class="fmtitle">Percentage of DC Shipments</div>' + one(pct_df, True, False) + "</div>"
+            + "</div></div>")
 
 
 def refresh_output_data(out_path):
@@ -843,7 +845,6 @@ def main():
         st.subheader("Summary – Shipment Count & Percentage (DC-wise)")
         count_summary, pct_summary = build_dc_summaries(stats.get("dc_counts", {}))
         st.markdown(summary_tables_html(count_summary, pct_summary, target_pct), unsafe_allow_html=True)
-        st.caption("Percentage is calculated on each DC's own shipment total.")
 
         st.subheader("Preview (First 50 Rows)")
         preview_df = st.session_state.get("preview_df")
