@@ -43,10 +43,7 @@ PCT_ROW_ORDER = [
     "Report Error",
 ]
 CF_GOOD_CATEGORY = "Connected ON time"
-CF_CONNECTED_GOOD_PCT = 95.0   # Connected ON time: >= 95%  -> green
-CF_CONNECTED_WARN_PCT = 90.0   #                    90-95%  -> yellow, below 90% -> red
-CF_MISS_BAD_PCT = 5.0          # Miss rows: >= 5% -> red
-CF_MISS_WARN_PCT = 1.0         #            1-5%  -> yellow, below 1% -> no colour
+CF_TARGET_PCT = 98.0   # Target for "Connected ON time" (both DCs)
 
 # in columns me date-time hota hai (comma wali text ho ya serial number)
 KNOWN_DT_COLS = [
@@ -553,22 +550,22 @@ def build_dc_summaries(dc_counts):
     return pd.DataFrame(count_rows), pd.DataFrame(pct_rows)
 
 
-def _cf_class(category, pct):
-    """Conditional-format class for one (category, DC) cell based on its percentage."""
+def _cf_class(category, pct, target):
+    """Conditional-format class (ok / mid / bad) for one cell, based on its percentage.
+    Connected ON time: green if >= target, else red.
+    Miss rows: the allowed miss budget is (100 - target). A row using half of it
+    or more is red, one using a tenth or more is yellow, smaller is green."""
     if category == CF_GOOD_CATEGORY:
-        if pct >= CF_CONNECTED_GOOD_PCT:
-            return "ok"
-        if pct >= CF_CONNECTED_WARN_PCT:
-            return "mid"
+        return "ok" if pct >= target else "bad"
+    budget = 100.0 - target
+    if pct >= budget / 2.0:
         return "bad"
-    if pct >= CF_MISS_BAD_PCT:
-        return "bad"
-    if pct >= CF_MISS_WARN_PCT:
+    if pct >= budget / 10.0:
         return "mid"
-    return ""
+    return "ok"
 
 
-def summary_tables_html(count_df, pct_df):
+def summary_tables_html(count_df, pct_df, target=CF_TARGET_PCT):
     """Count table (left) + percentage table (right) in ONE block, Excel-pivot style,
     with conditional formatting (green / yellow / red)."""
     import html as _html
@@ -582,10 +579,10 @@ def summary_tables_html(count_df, pct_df):
         "white-space:nowrap;color:#000;font-weight:400;}"
         ".fmsum th{background:#dde0f2;}"
         ".fmsum td:first-child{min-width:250px;}"
-        ".fmsum tr.gt td{background:#dde0f2;}"
-        ".fmsum td.ok{background:#c6efce;color:#006100;}"
-        ".fmsum td.mid{background:#ffeb9c;color:#9c5700;}"
-        ".fmsum td.bad{background:#ffc7ce;color:#9c0006;}"
+        ".fmsum tr.gt td{background:#dde0f2;font-weight:700;}"
+        ".fmsum td.ok,.fmsum tr.gt td.ok{background:#c6efce;color:#006100;}"
+        ".fmsum td.mid,.fmsum tr.gt td.mid{background:#ffeb9c;color:#9c5700;}"
+        ".fmsum td.bad,.fmsum tr.gt td.bad{background:#ffc7ce;color:#9c0006;}"
         ".fmsum.cnt th,.fmsum.cnt td{}"
         ".fmsum.cnt thead tr:first-child th{border-top-color:#ff0000;}"
         ".fmsum.cnt th:first-child,.fmsum.cnt td:first-child{border-left-color:#ff0000;}"
@@ -616,24 +613,30 @@ def summary_tables_html(count_df, pct_df):
                         txt = "{:.2f}%".format(float(v))
                     else:
                         txt = str(int(v))
-                    if not is_total:
+                    if is_total:
+                        cp = pct_lookup.get(CF_GOOD_CATEGORY, {}).get(cols[pos])
+                        if cp is not None:      # Grand Total row: did this DC meet the target?
+                            cls = "ok" if float(cp) >= target else "bad"
+                    else:
                         p = pct_lookup.get(category, {}).get(cols[pos])
                         if p is not None:
-                            cls = _cf_class(category, float(p))
+                            cls = _cf_class(category, float(p), target)
                 cells.append('<td class="{}">{}</td>'.format(cls, _html.escape(txt)))
             body.append('<tr class="{}">{}</tr>'.format("gt" if is_total else "", "".join(cells)))
         return '<table class="fmsum {}"><thead><tr>{}</tr></thead><tbody>{}</tbody></table>'.format(
             extra_class, head, "".join(body))
 
+    budget = 100.0 - target
     legend = (
         '<div class="fmsum-legend">'
         '<span style="background:#c6efce;color:#006100;">Good</span>'
         '<span style="background:#ffeb9c;color:#9c5700;">Watch</span>'
         '<span style="background:#ffc7ce;color:#9c0006;">Problem</span>'
-        "Connected ON time: {g:.0f}%+ good, {w:.0f}-{g:.0f}% watch, below {w:.0f}% problem. "
-        "Other rows: below {mw:.0f}% no colour, {mw:.0f}-{mb:.0f}% watch, {mb:.0f}%+ problem."
+        "Target {t:.0f}%. Connected ON time: {t:.0f}%+ green, below {t:.0f}% red. "
+        "Other rows: {y:.2f}% se kam green, {y:.2f}-{r:.2f}% yellow, {r:.2f}%+ red. "
+        "Grand Total row: green = DC ne target pura kiya, red = nahi kiya."
         "</div>"
-    ).format(g=CF_CONNECTED_GOOD_PCT, w=CF_CONNECTED_WARN_PCT, mw=CF_MISS_WARN_PCT, mb=CF_MISS_BAD_PCT)
+    ).format(t=target, y=budget / 10.0, r=budget / 2.0)
 
     return (css + '<div class="fmsum-wrap">' + one(count_df, False, "cnt") + one(pct_df, True, "pct")
             + "</div>" + legend)
@@ -714,6 +717,9 @@ def main():
                                            help="The Excel Processing column is set to 1 hour.")
         lastveh_hours = st.number_input("Last Vehicle Received Time (Hour of Day)", value=3.0, step=0.5,
                                         help="The Excel Last_Vehicle Recieved time column is set to 03:00.")
+        target_pct = st.number_input("Connected ON time Target (%)", value=CF_TARGET_PCT, step=0.5,
+                                     min_value=50.0, max_value=100.0,
+                                     help="Summary colours use this target (green = target met).")
 
     c1, c2 = st.columns(2)
     with c1:
@@ -823,7 +829,7 @@ def main():
 
         st.subheader("Summary – Shipment Count & Percentage (DC-wise)")
         count_summary, pct_summary = build_dc_summaries(stats.get("dc_counts", {}))
-        st.markdown(summary_tables_html(count_summary, pct_summary), unsafe_allow_html=True)
+        st.markdown(summary_tables_html(count_summary, pct_summary, target_pct), unsafe_allow_html=True)
         st.caption("Percentage is calculated on each DC's own shipment total.")
 
         st.subheader("Preview (First 50 Rows)")
