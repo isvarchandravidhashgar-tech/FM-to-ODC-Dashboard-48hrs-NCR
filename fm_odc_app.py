@@ -44,6 +44,14 @@ PCT_ROW_ORDER = [
 ]
 CF_GOOD_CATEGORY = "Connected ON time"
 CF_TARGET_PCT = 98.0   # Target for "Connected ON time" (both DCs)
+# Who is responsible for each miss (used for the Summary colours)
+CF_FM_CATEGORIES = ["FM Miss"]                      # FM side (not in DC team's control)
+CF_DATA_CATEGORIES = ["Report Error"]               # dashboard / data problem
+CF_TEAM_CATEGORIES = [                              # DC team's own misses
+    "Dock Miss Delay connected",
+    "Processing Miss-Delay Manifested",
+    "Processing Miss-Not Manifested",
+]
 
 # in columns me date-time hota hai (comma wali text ho ya serial number)
 KNOWN_DT_COLS = [
@@ -551,23 +559,23 @@ def build_dc_summaries(dc_counts):
 
 
 def _cf_class(category, pct, target):
-    """Conditional-format class (ok / mid / bad) for one cell, based on its percentage.
-    Connected ON time: green if >= target, else red.
-    Miss rows: the allowed miss budget is (100 - target). A row using half of it
-    or more is red, one using a tenth or more is yellow, smaller is green."""
-    if category == CF_GOOD_CATEGORY:
-        return "ok" if pct >= target else "bad"
+    """Conditional-format class for one cell (colour depends on WHO owns the miss + the value).
+    budget = 100 - target = the miss % allowed in total (2% for a 98% target)."""
     budget = 100.0 - target
-    if pct >= budget / 2.0:
-        return "bad"
-    if pct >= budget / 10.0:
-        return "mid"
-    return "ok"
+    if category == CF_GOOD_CATEGORY:
+        return "c-ok" if pct >= target else "c-low"
+    if category in CF_FM_CATEGORIES:
+        return "c-fmbig" if pct > budget else ("c-fm" if pct >= budget / 2.0 else "c-fmsmall")
+    if category in CF_DATA_CATEGORIES:
+        return "c-databig" if pct >= budget / 2.0 else "c-data"
+    if category in CF_TEAM_CATEGORIES:
+        return "c-team0" if pct == 0 else "c-team"
+    return ""
 
 
 def summary_tables_html(count_df, pct_df, target=CF_TARGET_PCT):
     """Count table (left) + percentage table (right) in ONE block, Excel-pivot style,
-    with conditional formatting (green / yellow / red)."""
+    with conditional formatting for management (who owns each miss)."""
     import html as _html
 
     css = (
@@ -579,17 +587,24 @@ def summary_tables_html(count_df, pct_df, target=CF_TARGET_PCT):
         "white-space:nowrap;color:#000;font-weight:400;}"
         ".fmsum th{background:#dde0f2;}"
         ".fmsum td:first-child{min-width:250px;}"
-        ".fmsum tr.gt td{background:#dde0f2;font-weight:700;}"
-        ".fmsum td.ok,.fmsum tr.gt td.ok{background:#c6efce;color:#006100;}"
-        ".fmsum td.mid,.fmsum tr.gt td.mid{background:#ffeb9c;color:#9c5700;}"
-        ".fmsum td.bad,.fmsum tr.gt td.bad{background:#ffc7ce;color:#9c0006;}"
-        ".fmsum.cnt th,.fmsum.cnt td{}"
+        ".fmsum tr.gt td{background:#dde0f2;color:#000;}"
+        ".fmsum.pct th,.fmsum.pct td{border:1.5px solid #595959;}"
+        ".fmsum.pct tr.gt td{font-weight:700;}"
+        ".fmsum td.c-ok{background:#c6efce;color:#006100;}"
+        ".fmsum td.c-low{background:#fce4d6;color:#c00000;}"
+        ".fmsum td.c-fmsmall{background:#fce4d6;color:#000;}"
+        ".fmsum td.c-fm{background:#f8cbad;color:#000;}"
+        ".fmsum td.c-fmbig{background:#c00000;color:#fff;font-weight:700;}"
+        ".fmsum td.c-data{background:#fff2cc;color:#000;}"
+        ".fmsum td.c-databig{background:#ffe699;color:#000;}"
+        ".fmsum td.c-team{background:#ededed;color:#ff0000;font-weight:700;}"
+        ".fmsum td.c-team0{background:#ededed;color:#595959;}"
         ".fmsum.cnt thead tr:first-child th{border-top-color:#ff0000;}"
         ".fmsum.cnt th:first-child,.fmsum.cnt td:first-child{border-left-color:#ff0000;}"
         ".fmsum.cnt th:last-child,.fmsum.cnt td:last-child{border-right-color:#ff0000;}"
         ".fmsum.cnt tbody tr:last-child td{border-bottom-color:#ff0000;}"
-        ".fmsum-legend{font-size:13px;margin-top:6px;}"
-        ".fmsum-legend span{padding:2px 8px;margin-right:8px;border:1px solid #7f7f7f;}"
+        ".fmsum-legend{font-size:13px;margin-top:8px;line-height:2;}"
+        ".fmsum-legend span{padding:2px 8px;margin-right:6px;border:1px solid #7f7f7f;white-space:nowrap;}"
         "</style>"
     )
 
@@ -608,16 +623,13 @@ def summary_tables_html(count_df, pct_df, target=CF_TARGET_PCT):
                 cls = ""
                 if pos == 0:
                     txt = category
+                    if not as_pct and not is_total:       # count table: colour the label cell too
+                        p0 = pct_lookup.get(category, {}).get("Grand Total")
+                        if p0 is not None:
+                            cls = _cf_class(category, float(p0), target)
                 else:
-                    if as_pct:
-                        txt = "{:.2f}%".format(float(v))
-                    else:
-                        txt = str(int(v))
-                    if is_total:
-                        cp = pct_lookup.get(CF_GOOD_CATEGORY, {}).get(cols[pos])
-                        if cp is not None:      # Grand Total row: did this DC meet the target?
-                            cls = "ok" if float(cp) >= target else "bad"
-                    else:
+                    txt = "{:.2f}%".format(float(v)) if as_pct else str(int(v))
+                    if not is_total:
                         p = pct_lookup.get(category, {}).get(cols[pos])
                         if p is not None:
                             cls = _cf_class(category, float(p), target)
@@ -629,14 +641,15 @@ def summary_tables_html(count_df, pct_df, target=CF_TARGET_PCT):
     budget = 100.0 - target
     legend = (
         '<div class="fmsum-legend">'
-        '<span style="background:#c6efce;color:#006100;">Good</span>'
-        '<span style="background:#ffeb9c;color:#9c5700;">Watch</span>'
-        '<span style="background:#ffc7ce;color:#9c0006;">Problem</span>'
-        "Target {t:.0f}%. Connected ON time: {t:.0f}%+ green, below {t:.0f}% red. "
-        "Other rows: {y:.2f}% se kam green, {y:.2f}-{r:.2f}% yellow, {r:.2f}%+ red. "
-        "Grand Total row: green = DC ne target pura kiya, red = nahi kiya."
+        '<span style="background:#c6efce;color:#006100;">Connected ON time: target {t:.0f}% achieved</span>'
+        '<span style="background:#fce4d6;color:#c00000;">Connected ON time: below {t:.0f}% target</span>'
+        '<span style="background:#f8cbad;">FM Miss (FM side)</span>'
+        '<span style="background:#c00000;color:#fff;">FM Miss alone is more than {b:.0f}% (target breaker)</span>'
+        '<span style="background:#ffe699;">Report Error (dashboard data issue)</span>'
+        '<span style="background:#ededed;color:#ff0000;font-weight:700;">DC team miss: Dock Miss Delay connected, '
+        'Processing Miss-Delay Manifested, Processing Miss-Not Manifested</span>'
         "</div>"
-    ).format(t=target, y=budget / 10.0, r=budget / 2.0)
+    ).format(t=target, b=budget)
 
     return (css + '<div class="fmsum-wrap">' + one(count_df, False, "cnt") + one(pct_df, True, "pct")
             + "</div>" + legend)
