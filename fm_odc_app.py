@@ -500,6 +500,9 @@ def build_dc_summaries(dc_counts):
             del dc_counts[tauru_key]
 
     dcs = sorted(dc_counts.keys(), key=lambda x: str(x).casefold())
+    # Same row order in both tables: biggest Grand Total first (like the Excel pivot).
+    cat_totals = {c: sum(int(dc_counts.get(dc, {}).get(c, 0)) for dc in dcs) for c in categories}
+    categories = sorted(categories, key=lambda c: (-cat_totals[c], categories.index(c)))
     count_rows = []
     pct_rows = []
     dc_totals = {dc: sum(dc_counts.get(dc, {}).values()) for dc in dcs}
@@ -527,6 +530,43 @@ def build_dc_summaries(dc_counts):
     count_rows.append(total_count)
     pct_rows.append(total_pct)
     return pd.DataFrame(count_rows), pd.DataFrame(pct_rows)
+
+
+def summary_tables_html(count_df, pct_df):
+    """Count table (left) + percentage table (right) in ONE block, Excel-pivot style."""
+    import html as _html
+
+    css = (
+        "<style>"
+        ".fmsum-wrap{display:flex;flex-wrap:wrap;gap:48px;align-items:flex-start;overflow-x:auto;padding:4px 0;}"
+        ".fmsum{border-collapse:collapse;font-family:Calibri,'Segoe UI',Arial,sans-serif;"
+        "font-size:15px;color:#000;background:#fff;}"
+        ".fmsum th,.fmsum td{border:1px solid #ff0000;padding:6px 12px;text-align:center;"
+        "white-space:nowrap;color:#000;font-weight:400;}"
+        ".fmsum th{background:#dde0f2;}"
+        ".fmsum td:first-child{min-width:250px;}"
+        ".fmsum tr.gt td{background:#dde0f2;}"
+        "</style>"
+    )
+
+    def one(df, as_pct):
+        head = "".join("<th>{}</th>".format(_html.escape(str(c))) for c in df.columns)
+        body = []
+        last = len(df) - 1
+        for idx, row in enumerate(df.itertuples(index=False)):
+            cells = []
+            for pos, v in enumerate(row):
+                if pos == 0:
+                    txt = str(v)
+                elif as_pct:
+                    txt = "{:.0f}%".format(float(v))
+                else:
+                    txt = str(int(v))
+                cells.append("<td>{}</td>".format(_html.escape(txt)))
+            body.append('<tr class="{}">{}</tr>'.format("gt" if idx == last else "", "".join(cells)))
+        return '<table class="fmsum"><thead><tr>{}</tr></thead><tbody>{}</tbody></table>'.format(head, "".join(body))
+
+    return css + '<div class="fmsum-wrap">' + one(count_df, False) + one(pct_df, True) + "</div>"
 
 
 def refresh_output_data(out_path):
@@ -597,7 +637,6 @@ def main():
     st.set_page_config(page_title="FM-to-ODC-Dashboard-48hrs-NCR", layout="wide")
     st.title("FM-to-ODC-Dashboard-48hrs-NCR")
     st.caption("Upload the two daily files, generate the report, and download the final CSV.")
-    st.info("Only FM ODC source columns A:CN are used. Any extra columns after CN (such as CO:CP) are ignored; the formula columns are added by this application.")
 
     with st.sidebar:
         st.header("Settings")
@@ -712,20 +751,10 @@ def main():
         if stats["bad_dates"]:
             st.warning("Some date-time values could not be interpreted and were treated as blank: {}".format(stats["bad_dates"]))
 
-        st.subheader("Summary – Shipment Count (DC-wise)")
+        st.subheader("Summary – Shipment Count & Percentage (DC-wise)")
         count_summary, pct_summary = build_dc_summaries(stats.get("dc_counts", {}))
-        st.dataframe(count_summary, hide_index=True, use_container_width=True)
-        st.subheader("Summary – Percentage (DC-wise)")
-        st.caption("Each DC percentage is calculated using that DC's own shipment total. Grand Total percentage uses the overall shipment total.")
-        # Display rounded whole percentages with a % sign (e.g. 97%).
-        # Keep the original numeric pct_summary unchanged for calculations.
-        pct_summary_display = pct_summary.copy()
-        for col in pct_summary_display.columns:
-            if col != "Final_Remarks":
-                pct_summary_display[col] = pct_summary_display[col].map(
-                    lambda value: "{:.0f}%".format(float(value))
-                )
-        st.dataframe(pct_summary_display, hide_index=True, use_container_width=True)
+        st.markdown(summary_tables_html(count_summary, pct_summary), unsafe_allow_html=True)
+        st.caption("Percentage is calculated on each DC's own shipment total.")
 
         st.subheader("Preview (First 50 Rows)")
         preview_df = st.session_state.get("preview_df")
