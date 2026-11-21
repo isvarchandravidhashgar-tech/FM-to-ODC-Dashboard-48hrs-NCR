@@ -42,6 +42,42 @@ PCT_ROW_ORDER = [
     "Processing Miss-Not Manifested",
     "Report Error",
 ]
+# Drill-down (filter) section: these Final_Remarks rows are kept in memory for the click-to-filter tables
+DRILL_CATEGORIES = [
+    "FM Miss",
+    "Processing Miss-Delay Manifested",
+    "Processing Miss-Not Manifested",
+    "Dock Miss Delay connected",
+]
+DRILL_COLS = [
+    "awb_number", "manifest_code", "Client", "pickup_hub", "destination_hub", "bagging_dc_name",
+    "Lane", "Cut_Off", "Processing_cut_off", "in_transit",
+    "picked_date", "recd_at_pickup_hub_date", "manifest_creation_at_pickup_hub",
+    "manifest_intransit_from_pickup_hub", "manifest_received_at_odc_metadata",
+    "manifest_intransit_from_odc_metadata", "manifest_received_bagging_dc",
+    "shipment_received_at_bagging_dc", "manifest_ODC_creation_date", "manifest_intransit_from_odc",
+    "Bucket", "Date_24Hrs", "Date_46Hrs", "Final_Remarks",
+    "(1)recd_at_pickup_hub_date", "(2)manifest_creation_at_pickup_hub",
+    "(3)manifest_intransit_from_pickup_hub", "(4)manifest_received_at_odc_metadata",
+    "(5)manifest_intransit_from_odc_metadata", "(6)manifest_received_bagging_dc",
+    "(7)shipment_received_at_bagging_dc",
+]
+FM_DETAIL_COLS = [
+    "awb_number", "manifest_code", "Client", "pickup_hub", "destination_hub", "DC", "Lane",
+    "picked_date", "recd_at_pickup_hub_date", "manifest_creation_at_pickup_hub",
+    "manifest_intransit_from_pickup_hub", "manifest_received_at_odc_metadata",
+    "manifest_intransit_from_odc_metadata", "manifest_received_bagging_dc",
+    "shipment_received_at_bagging_dc", "Bucket", "Missed Stage", "Delay (hrs)",
+]
+LANE_DETAIL_COLS = [
+    "awb_number", "manifest_code", "Client", "pickup_hub", "destination_hub", "DC", "Lane",
+    "Cut_Off", "Processing_cut_off", "in_transit",
+    "recd_at_pickup_hub_date", "manifest_creation_at_pickup_hub", "manifest_intransit_from_pickup_hub",
+    "manifest_received_at_odc_metadata", "manifest_received_bagging_dc",
+    "shipment_received_at_bagging_dc", "manifest_ODC_creation_date", "manifest_intransit_from_odc",
+    "Date_24Hrs", "Date_46Hrs", "Delay (hrs)",
+]
+
 CF_GOOD_CATEGORY = "Connected ON time"
 CF_TARGET_PCT = 98.0   # Target for "Connected ON time" (both DCs)
 # Who is responsible for each miss (used for the Summary colours)
@@ -657,6 +693,221 @@ def summary_tables_html(count_df, pct_df, target=CF_TARGET_PCT):
             + "</div></div>")
 
 
+# ---------------------------------------------------------------- drill-down (filters)
+def merge_dc_names(series):
+    """bagging_dc_name -> DC name (NCR Tauru DC is merged into NCR Bilaspur DC, like the summary)."""
+    s = series.fillna("").astype(str).str.strip()
+    s = s.where(s != "", "(Blank DC)")
+    return s.where(s.str.casefold() != "ncr tauru dc", "NCR Bilaspur DC")
+
+
+def collect_drill(out, stats):
+    """Keep only the miss rows (small) needed for the click-to-filter tables."""
+    sub = out[out["Final_Remarks"].isin(DRILL_CATEGORIES)]
+    if len(sub):
+        cols = [c for c in DRILL_COLS if c in sub.columns]
+        stats.setdefault("drill_parts", []).append(sub[cols].copy())
+
+
+def prepare_drill(stats):
+    parts = stats.pop("drill_parts", [])
+    if not parts:
+        stats["drill"] = pd.DataFrame()
+        return
+    d = pd.concat(parts, ignore_index=True)
+    d["DC"] = merge_dc_names(d["bagging_dc_name"] if "bagging_dc_name" in d.columns else pd.Series("", index=d.index))
+
+    # FM Miss: which stage(s) were late and by how many hours vs Bucket
+    bucket = pd.to_datetime(d["Bucket"], errors="coerce")
+    stage_delay = []
+    missed = pd.Series("", index=d.index)
+    for new, src in CHECK_COLS:
+        if new in d.columns and src in d.columns:
+            flag = d[new].astype(str).eq("FM Miss")
+            ev = pd.to_datetime(d[src], errors="coerce")
+            stage_delay.append(((ev - bucket).dt.total_seconds() / 3600.0).where(flag))
+            missed = missed + np.where(flag, new[:3] + " ", "")
+    fm_delay = pd.concat(stage_delay, axis=1).max(axis=1) if stage_delay else pd.Series(np.nan, index=d.index)
+    d["Missed Stage"] = missed.str.strip()
+
+    # Processing Miss-Delay Manifested: manifest creation after the 48 hr deadline
+    d46 = pd.to_datetime(d["Date_46Hrs"], errors="coerce")
+    mfd = pd.to_datetime(d["manifest_ODC_creation_date"], errors="coerce")
+    proc_delay = (mfd - d46).dt.total_seconds() / 3600.0
+    # Dock Miss Delay connected: in_transit hours beyond 48 hrs 30 sec
+    dock_delay = pd.to_numeric(d["in_transit"], errors="coerce") - (48 + 30 / 3600)
+    cat = d["Final_Remarks"]
+    d["Delay (hrs)"] = np.round(np.select(
+        [cat.eq("FM Miss").to_numpy(),
+         cat.eq("Processing Miss-Delay Manifested").to_numpy(),
+         cat.eq("Dock Miss Delay connected").to_numpy()],
+        [fm_delay.to_numpy(dtype=float), proc_delay.to_numpy(dtype=float), dock_delay.to_numpy(dtype=float)],
+        default=np.nan), 2)
+    stats["drill"] = d
+
+
+def _dc_filter(d, dc):
+    return d if dc in (None, "All") else d[d["DC"] == dc]
+
+
+def _fmt_time(s):
+    return s.dt.strftime("%Y-%m-%d %H:%M:%S").fillna("")
+
+
+def fm_hub_table(d, dc):
+    x = _dc_filter(d[d["Final_Remarks"] == "FM Miss"], dc)
+    if x.empty:
+        return pd.DataFrame()
+    w = x.assign(_c=pd.to_datetime(x["manifest_intransit_from_pickup_hub"], errors="coerce"))
+    g = w.groupby(["pickup_hub", "DC"], dropna=False).agg(
+        **{"FM Miss Shipments": ("Delay (hrs)", "size"),
+           "Avg Delay (hrs)": ("Delay (hrs)", "mean"),
+           "First Connected": ("_c", "min"),
+           "Last Connected": ("_c", "max")}).reset_index()
+    g["Avg Delay (hrs)"] = g["Avg Delay (hrs)"].round(2)
+    g["First Connected"] = _fmt_time(g["First Connected"])
+    g["Last Connected"] = _fmt_time(g["Last Connected"])
+    g["First Connected"] = g["First Connected"].replace("", "-")
+    g["Last Connected"] = g["Last Connected"].replace("", "-")
+    g = g.sort_values("FM Miss Shipments", ascending=False).reset_index(drop=True)
+    return g.rename(columns={"pickup_hub": "Pickup Hub"})
+
+
+def fm_hub_detail(d, dc, hub, hub_dc):
+    x = _dc_filter(d[(d["Final_Remarks"] == "FM Miss") & (d["pickup_hub"] == hub) & (d["DC"] == hub_dc)], dc)
+    if x.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    w = x.assign(
+        _odc=pd.to_datetime(x["manifest_received_at_odc_metadata"], errors="coerce"),
+        _bag=pd.to_datetime(x["manifest_received_bagging_dc"], errors="coerce"),
+    )
+    by_time = w.groupby("manifest_intransit_from_pickup_hub", dropna=False).agg(
+        **{"Shipments": ("Delay (hrs)", "size"),
+           "Received at ODC (first)": ("_odc", "min"),
+           "Received at Bagging DC (first)": ("_bag", "min"),
+           "Max Delay (hrs)": ("Delay (hrs)", "max")}).reset_index()
+    by_time["Received at ODC (first)"] = _fmt_time(by_time["Received at ODC (first)"])
+    by_time["Received at Bagging DC (first)"] = _fmt_time(by_time["Received at Bagging DC (first)"])
+    by_time = by_time.rename(columns={"manifest_intransit_from_pickup_hub": "Connected from Pickup Hub"})
+    by_time["Connected from Pickup Hub"] = by_time["Connected from Pickup Hub"].replace("", "Not connected (no time)")
+    by_time = by_time.sort_values("Connected from Pickup Hub").reset_index(drop=True)
+    cols = [c for c in FM_DETAIL_COLS if c in x.columns]
+    ships = x[cols].sort_values("manifest_intransit_from_pickup_hub").reset_index(drop=True)
+    return by_time, ships
+
+
+def lane_table(d, category, dc):
+    x = _dc_filter(d[d["Final_Remarks"] == category], dc)
+    if x.empty:
+        return pd.DataFrame()
+    g = x.groupby(["Lane", "Cut_Off", "Processing_cut_off"], dropna=False).agg(
+        **{"Missed Shipments": ("Delay (hrs)", "size"), "Avg Delay (hrs)": ("Delay (hrs)", "mean")}
+    ).reset_index()
+    g["Avg Delay (hrs)"] = g["Avg Delay (hrs)"].round(2)
+    g = g.sort_values("Missed Shipments", ascending=False).reset_index(drop=True)
+    return g.rename(columns={"Processing_cut_off": "Processing Cut-off"})
+
+
+def lane_detail(d, category, dc, lane, cut_off, proc_cut):
+    x = _dc_filter(d[(d["Final_Remarks"] == category) & (d["Lane"] == lane)
+                     & (d["Cut_Off"] == cut_off) & (d["Processing_cut_off"] == proc_cut)], dc)
+    cols = [c for c in LANE_DETAIL_COLS if c in x.columns]
+    return x[cols].reset_index(drop=True)
+
+
+def show_df(st, df, selectable=False, key=None):
+    """st.dataframe that works on old and new Streamlit versions."""
+    base = {"hide_index": True}
+    if selectable:
+        base.update(on_select="rerun", selection_mode="single-row", key=key)
+    for width_kw in ({"width": "stretch"}, {"use_container_width": True}, {}):
+        try:
+            return st.dataframe(df, **width_kw, **base)
+        except Exception:
+            continue
+    return st.dataframe(df, hide_index=True)
+
+
+def pick_row(st, df, label_cols, event, key):
+    """Row clicked in the table. If this Streamlit version has no click-selection, use a dropdown."""
+    if hasattr(event, "selection"):
+        rows = getattr(event.selection, "rows", None)
+        if rows and rows[0] < len(df):
+            return rows[0]
+        return None
+    labels = [" | ".join(str(df.iloc[i][c]) for c in label_cols) for i in range(len(df))]
+    choice = st.selectbox("Select a row", ["-"] + labels, key=key + "_box")
+    return None if choice == "-" else labels.index(choice)
+
+
+def _download(st, df, name, key):
+    st.download_button("Download this table (CSV)", df.to_csv(index=False).encode("utf-8-sig"),
+                       file_name=name, mime="text/csv", key=key)
+
+
+def _render_fm_tab(st, d, dc):
+    hubs = fm_hub_table(d, dc)
+    if hubs.empty:
+        st.info("No FM Miss shipments for this selection.")
+        return
+    st.markdown("Total FM Miss shipments: **{:,}** | Pickup hubs: **{:,}**. "
+                "Click a Pickup Hub row to see its date-time details.".format(
+                    int(hubs["FM Miss Shipments"].sum()), len(hubs)))
+    ev = show_df(st, hubs, selectable=True, key="fm_hub_sel_" + str(dc))
+    idx = pick_row(st, hubs, ["Pickup Hub", "DC"], ev, "fm_hub")
+    if idx is None:
+        return
+    hub, hub_dc = hubs.loc[idx, "Pickup Hub"], hubs.loc[idx, "DC"]
+    by_time, ships = fm_hub_detail(d, dc, hub, hub_dc)
+    if ships.empty:
+        return
+    st.markdown("#### {} ({}) - {:,} FM Miss shipments".format(hub, hub_dc, len(ships)))
+    st.markdown("**When this hub connected the shipments, and when the DC received them**")
+    show_df(st, by_time)
+    st.markdown("**Shipment-wise date-time details**")
+    show_df(st, ships)
+    _download(st, ships, "FM_Miss_{}.csv".format(re.sub(r"[^A-Za-z0-9]+", "_", str(hub))), "fm_dl")
+
+
+def _render_lane_tab(st, d, category, dc, key):
+    lanes = lane_table(d, category, dc)
+    if lanes.empty:
+        st.info("No '{}' shipments for this selection.".format(category))
+        return
+    st.markdown("Total {} shipments: **{:,}** | Lanes: **{:,}**. Click a Lane row to see the shipments.".format(
+        category, int(lanes["Missed Shipments"].sum()), len(lanes)))
+    ev = show_df(st, lanes, selectable=True, key=key + "_sel_" + str(dc))
+    idx = pick_row(st, lanes, ["Lane", "Cut_Off"], ev, key)
+    if idx is None:
+        return
+    row = lanes.loc[idx]
+    ships = lane_detail(d, category, dc, row["Lane"], row["Cut_Off"], row["Processing Cut-off"])
+    st.markdown("#### {} - Cut-off {} - {:,} shipments".format(row["Lane"], row["Cut_Off"], len(ships)))
+    show_df(st, ships)
+    _download(st, ships, "{}_{}.csv".format(key, re.sub(r"[^A-Za-z0-9]+", "_", str(row["Lane"]))), key + "_dl")
+
+
+def render_drilldown(st, stats):
+    d = stats.get("drill")
+    if d is None or d.empty:
+        st.info("No FM Miss / Processing Miss / Dock Miss shipments found in this file.")
+        return
+    st.subheader("Drill-down (click a row to filter)")
+    dc = st.radio("DC", ["All"] + sorted(d["DC"].unique()), horizontal=True, key="drill_dc")
+    tabs = st.tabs(["FM Miss - Pickup Hub",
+                    "Processing Miss-Delay Manifested - Lane",
+                    "Dock Miss Delay connected - Lane",
+                    "Processing Miss-Not Manifested - Lane"])
+    with tabs[0]:
+        _render_fm_tab(st, d, dc)
+    with tabs[1]:
+        _render_lane_tab(st, d, "Processing Miss-Delay Manifested", dc, "proc_delay")
+    with tabs[2]:
+        _render_lane_tab(st, d, "Dock Miss Delay connected", dc, "dock_delay")
+    with tabs[3]:
+        _render_lane_tab(st, d, "Processing Miss-Not Manifested", dc, "proc_notman")
+
+
 def refresh_output_data(out_path):
     """Re-read temporary output and rebuild DC-wise count/percentage summaries."""
     dc_counts = {}
@@ -695,6 +946,7 @@ def run_job(dash_file, map_file, processing_hours, lastveh_hours, out_path, prog
             if dt_cols is None:
                 dt_cols = detect_dt_cols(ch)
             out = process_chunk(ch, hub_to_lane, lane_info, dt_cols, processing_days, lastveh_days, stats)
+            collect_drill(out, stats)
             out.to_csv(fh, index=False, header=first)
             first = False
             if progress:
@@ -703,6 +955,7 @@ def run_job(dash_file, map_file, processing_hours, lastveh_hours, out_path, prog
                 except Exception:
                     frac = None
                 progress(stats["rows"], frac, time.time() - t0)
+    prepare_drill(stats)
     stats["seconds"] = round(time.time() - t0, 1)
     stats["dt_cols"] = dt_cols or []
     return stats
@@ -846,15 +1099,7 @@ def main():
         count_summary, pct_summary = build_dc_summaries(stats.get("dc_counts", {}))
         st.markdown(summary_tables_html(count_summary, pct_summary, target_pct), unsafe_allow_html=True)
 
-        st.subheader("Preview (First 50 Rows)")
-        preview_df = st.session_state.get("preview_df")
-        if preview_df is None:
-            preview_df = pd.read_csv(temp_path, nrows=50, dtype=str, keep_default_na=False,
-                                     encoding="utf-8-sig")
-        st.dataframe(preview_df)
-        with st.expander("Date-Time Columns Cleaned"):
-            st.write(stats["dt_cols"])
-
+        render_drilldown(st, stats)
 
 
 if __name__ == "__main__":
